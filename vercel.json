@@ -1,0 +1,15 @@
+{
+  "rewrites": [
+    { "source": "/api/config", "destination": "/api/config" },
+    { "source": "/api/proxy", "destination": "/api/proxy" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ],
+  "functions": {
+    "api/proxy.py": {
+      "maxDuration": 30
+    },
+    "api/config.py": {
+      "maxDuration": 15
+    }
+  }
+}
