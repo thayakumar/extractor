@@ -18,14 +18,19 @@ class handler(BaseHTTPRequestHandler):
             return
 
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://online.anyflip.com/",
+            })
             with urllib.request.urlopen(req, timeout=20) as resp:
                 data = resp.read()
                 content_type = resp.headers.get("Content-Type", "image/webp")
-        except Exception:
+        except Exception as e:
             self.send_response(502)
             self.end_headers()
-            self.wfile.write(b"Upstream fetch failed")
+            self.wfile.write(f"Upstream fetch failed: {e}".encode())
             return
 
         self.send_response(200)

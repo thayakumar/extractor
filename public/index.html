@@ -312,7 +312,7 @@ async function runAnyflipVercel(url) {
   let idx = 0;
 
   async function downloadOne(i) {
-    const resp = await fetch(`/api/proxy?url=${encodeURIComponent(cfg.baseUrl + '/' + cfg.pages[i])}`);
+    const resp = await fetch(`/api/proxy?url=${encodeURIComponent(cfg.pages[i])}`);
     if (!resp.ok) throw new Error(`Failed page ${i + 1}`);
     const blob = await resp.blob();
     return new Promise((resolve, reject) => {

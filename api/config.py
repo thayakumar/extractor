@@ -48,15 +48,22 @@ class handler(BaseHTTPRequestHandler):
 
         pages = config.get("fliphtml5_pages", [])
         meta = config.get("meta", {})
-        hashes = [p["n"][0] for p in pages if p.get("n")]
+        raw = [p["n"][0] for p in pages if p.get("n")]
+        resolved = []
+        for r in raw:
+            if r.startswith("../"):
+                resolved.append(f"{base}/{r[3:]}")
+            elif r.startswith("http"):
+                resolved.append(r)
+            else:
+                resolved.append(f"{base}/files/large/{r}")
 
         self._json({
             "title": meta.get("title", "flipbook"),
             "pageCount": meta.get("pageCount", len(pages)),
             "pageWidth": meta.get("pageWidth", 595),
             "pageHeight": meta.get("pageHeight", 842),
-            "baseUrl": f"{base}/files/large",
-            "pages": hashes,
+            "pages": resolved,
         })
 
     def _json(self, data, status=200):
