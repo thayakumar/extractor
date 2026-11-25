@@ -307,11 +307,12 @@ async function runAnyflipVercel(url) {
   pdfName = cfg.title.replace(/[^\w\s-]/g, '').trim().substring(0, 60) + '.pdf';
 
   const images = new Array(cfg.pages.length);
+  const failed = [];
   let done = 0;
-  const CONCURRENCY = 6;
+  const CONCURRENCY = 8;
   let idx = 0;
 
-  function webpToJpeg(blob) {
+  function imgToJpeg(blob) {
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => {
@@ -336,7 +337,7 @@ async function runAnyflipVercel(url) {
         const resp = await fetch(`/api/proxy?url=${encodeURIComponent(cfg.pages[i])}`);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const raw = await resp.blob();
-        const jpeg = await webpToJpeg(raw);
+        const jpeg = await imgToJpeg(raw);
         return new Promise((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve(reader.result);
@@ -353,14 +354,29 @@ async function runAnyflipVercel(url) {
   async function worker() {
     while (idx < cfg.pages.length) {
       const i = idx++;
-      try { images[i] = await downloadOne(i); } catch { images[i] = null; }
+      try {
+        images[i] = await downloadOne(i);
+      } catch {
+        images[i] = null;
+        failed.push(i + 1);
+      }
       done++;
-      $('pfill').style.width = Math.round((done / cfg.pages.length) * 100) + '%';
+      const pct = Math.round((done / cfg.pages.length) * 100);
+      $('pfill').style.width = pct + '%';
       $('pcount').textContent = `${done} / ${cfg.pages.length}`;
+      if (failed.length) {
+        $('sline').textContent = `${failed.length} page(s) failed`;
+      }
     }
   }
 
   await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+
+  const successCount = cfg.pages.length - failed.length;
+  if (successCount === 0) {
+    fail(`All ${cfg.pages.length} pages failed to download. The book may be restricted.`);
+    return;
+  }
 
   $('plabel').textContent = 'Assembling PDF...';
   $('pcount').textContent = '';
@@ -377,22 +393,21 @@ async function runAnyflipVercel(url) {
     const ph = (cfg.pageHeight || 842) * 0.3528;
     const doc = new jsPDF({ orientation: pw > ph ? 'l' : 'p', unit: 'mm', format: [pw, ph] });
     let first = true;
-    const BATCH = 10;
     for (let i = 0; i < images.length; i++) {
       if (!images[i]) continue;
       if (!first) doc.addPage([pw, ph]);
       first = false;
       doc.addImage(images[i], 'JPEG', 0, 0, pw, ph);
-      images[i] = null; // free memory
-      if (i % BATCH === 0) {
-        $('sline').textContent = `Stitching page ${i + 1} / ${images.length}...`;
+      images[i] = null;
+      if (i % 10 === 0) {
+        $('sline').textContent = `Stitching page ${i + 1} / ${cfg.pages.length}...`;
         await new Promise(r => setTimeout(r, 0));
       }
     }
     pdfBlob = doc.output('blob');
   } catch (e) { fail('PDF assembly failed: ' + e.message); return; }
 
-  showDone(done);
+  showDone(successCount, failed);
 }
 
 async function runLocal(url) {
@@ -438,14 +453,18 @@ async function pollStatus() {
   } catch {}
 }
 
-function showDone(pageCount) {
+function showDone(pageCount, failedPages) {
   $('pfill').style.width = '100%';
   $('pfill').classList.add('ok');
   $('plabel').textContent = 'Complete';
   $('pcount').textContent = '';
-  $('sline').textContent = '';
   const sizeMb = (pdfBlob.size / (1024 * 1024)).toFixed(1);
-  $('dinfo').textContent = `${pageCount} pages · ${sizeMb} MB`;
+  let info = `${pageCount} pages · ${sizeMb} MB`;
+  if (failedPages && failedPages.length) {
+    info += ` (${failedPages.length} skipped: ${failedPages.length <= 5 ? failedPages.join(', ') : failedPages.slice(0, 5).join(', ') + '...'})`;
+  }
+  $('dinfo').textContent = info;
+  $('sline').textContent = '';
   $('done').hidden = false;
   $('pview').hidden = false;
   $('frame').src = URL.createObjectURL(pdfBlob);
@@ -467,8 +486,15 @@ function showDoneServer(job) {
   $('go').textContent = 'Convert';
 }
 
+function normalizeUrl(raw) {
+  let u = raw.trim().replace(/\/+$/, '');
+  u = u.replace(/\/mobile(\/index\.html)?$/, '');
+  u = u.replace(/^https?:\/\/anyflip\.com\//, 'https://online.anyflip.com/');
+  return u;
+}
+
 async function run() {
-  const url = $('inp').value.trim();
+  const url = normalizeUrl($('inp').value);
   if (!url) { $('inp').focus(); return; }
 
   reset();
