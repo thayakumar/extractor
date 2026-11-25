@@ -311,16 +311,43 @@ async function runAnyflipVercel(url) {
   const CONCURRENCY = 6;
   let idx = 0;
 
-  async function downloadOne(i) {
-    const resp = await fetch(`/api/proxy?url=${encodeURIComponent(cfg.pages[i])}`);
-    if (!resp.ok) throw new Error(`Failed page ${i + 1}`);
-    const blob = await resp.blob();
+  function webpToJpeg(blob) {
     return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        const c = document.createElement('canvas');
+        c.width = img.naturalWidth;
+        c.height = img.naturalHeight;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.drawImage(img, 0, 0);
+        c.toBlob(b => b ? resolve(b) : reject(new Error('Canvas export failed')), 'image/jpeg', 0.92);
+        URL.revokeObjectURL(img.src);
+      };
+      img.onerror = () => { URL.revokeObjectURL(img.src); reject(new Error('Image decode failed')); };
+      img.src = URL.createObjectURL(blob);
     });
+  }
+
+  async function downloadOne(i, retries = 3) {
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        const resp = await fetch(`/api/proxy?url=${encodeURIComponent(cfg.pages[i])}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const raw = await resp.blob();
+        const jpeg = await webpToJpeg(raw);
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(jpeg);
+        });
+      } catch (e) {
+        if (attempt === retries - 1) throw e;
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
   }
 
   async function worker() {
@@ -350,16 +377,22 @@ async function runAnyflipVercel(url) {
     const ph = (cfg.pageHeight || 842) * 0.3528;
     const doc = new jsPDF({ orientation: pw > ph ? 'l' : 'p', unit: 'mm', format: [pw, ph] });
     let first = true;
+    const BATCH = 10;
     for (let i = 0; i < images.length; i++) {
       if (!images[i]) continue;
       if (!first) doc.addPage([pw, ph]);
       first = false;
-      doc.addImage(images[i], 'WEBP', 0, 0, pw, ph);
+      doc.addImage(images[i], 'JPEG', 0, 0, pw, ph);
+      images[i] = null; // free memory
+      if (i % BATCH === 0) {
+        $('sline').textContent = `Stitching page ${i + 1} / ${images.length}...`;
+        await new Promise(r => setTimeout(r, 0));
+      }
     }
     pdfBlob = doc.output('blob');
   } catch (e) { fail('PDF assembly failed: ' + e.message); return; }
 
-  showDone(images.filter(Boolean).length);
+  showDone(done);
 }
 
 async function runLocal(url) {
