@@ -127,8 +127,10 @@ class handler(BaseHTTPRequestHandler):
 
         meta = config.get("meta", {})
         pages = _resolve_pages(config, base)
+        bc = config.get("bookConfig")
+        bc_title = bc.get("BookTitle", "") if isinstance(bc, dict) else ""
         title = (
-            config.get("bookConfig", {}).get("BookTitle", "")
+            bc_title
             or meta.get("title", "")
             or config.get("bookTitle", "")
             or "flipbook"
