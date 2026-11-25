@@ -183,13 +183,12 @@ body { font-family: var(--font); background: var(--bg); color: var(--fg); min-he
     <button class="tab" onclick="switchTab('scribd')" id="tab-scribd">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
       Scribd
-      <span class="badge badge-local">Local only</span>
     </button>
   </div>
 
   <div id="scribd-disabled" class="disabled-note" hidden>
-    Scribd extraction needs a headless browser and only works when running locally.<br>
-    Run <code style="font-family:var(--mono);background:var(--surface);padding:2px 6px;border-radius:4px">python3 extractor_server.py</code> on your machine for full Scribd support.
+    Scribd may block cloud requests via Cloudflare. If it fails, run
+    <code style="font-family:var(--mono);background:var(--surface);padding:2px 6px;border-radius:4px">python3 extractor_server.py</code> locally for guaranteed results.
   </div>
 
   <div class="input-row">
@@ -265,9 +264,8 @@ function switchTab(tab) {
   $('inp').placeholder = PLACEHOLDERS[tab];
   $('go').className = 'btn btn-go' + (tab === 'scribd' ? ' scribd' : '');
 
-  const scribdBlocked = tab === 'scribd' && IS_VERCEL;
-  $('scribd-disabled').hidden = !scribdBlocked;
-  $('go').disabled = scribdBlocked;
+  $('scribd-disabled').hidden = true;
+  $('go').disabled = false;
 
   reset();
 }
@@ -410,6 +408,143 @@ async function runAnyflipVercel(url) {
   showDone(successCount, failed);
 }
 
+// ── Scribd (SSE-based on Vercel) ──
+
+async function runScribdVercel(url) {
+  $('plabel').textContent = 'Launching browser...';
+  $('sline').textContent = 'This may take a minute...';
+
+  const images = [];
+  let totalPages = 0;
+  let title = 'Scribd Document';
+  const failed = [];
+
+  try {
+    const resp = await fetch('/api/scribd', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+
+    if (!resp.ok) {
+      fail(`Server error: ${resp.status}`);
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      let eventType = '';
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          eventType = line.slice(7).trim();
+        } else if (line.startsWith('data: ') && eventType) {
+          try {
+            const data = JSON.parse(line.slice(6));
+            handleScribdEvent(eventType, data);
+          } catch {}
+          eventType = '';
+        }
+      }
+    }
+  } catch (e) {
+    fail('Connection failed: ' + e.message);
+    return;
+  }
+
+  function handleScribdEvent(event, data) {
+    if (event === 'status') {
+      $('plabel').textContent = data.message || data.status;
+      if (data.total && data.done !== undefined) {
+        const pct = Math.round((data.done / data.total) * 100);
+        $('pfill').style.width = pct + '%';
+        $('pcount').textContent = `${data.done} / ${data.total}`;
+      }
+      $('sline').textContent = '';
+    } else if (event === 'info') {
+      title = data.title || 'Scribd Document';
+      totalPages = data.pageCount || 0;
+      $('btitle').textContent = title;
+      $('bpages').textContent = `${totalPages} pages`;
+      pdfName = title.replace(/[^\w\s-]/g, '').trim().substring(0, 60) + '.pdf';
+    } else if (event === 'page') {
+      images.push('data:image/jpeg;base64,' + data.data);
+      const pct = Math.round((images.length / (totalPages || 1)) * 100);
+      $('pfill').style.width = pct + '%';
+      $('pcount').textContent = `${images.length} / ${totalPages}`;
+    } else if (event === 'page_error') {
+      failed.push(data.index + 1);
+      $('sline').textContent = `${failed.length} page(s) failed`;
+    } else if (event === 'error') {
+      fail(data.error || 'Unknown error');
+    } else if (event === 'done') {
+      assembleScribdPdf();
+    }
+  }
+
+  async function assembleScribdPdf() {
+    if (images.length === 0) {
+      fail('No pages were captured.');
+      return;
+    }
+
+    $('plabel').textContent = 'Assembling PDF...';
+    $('pfill').style.width = '100%';
+    $('pcount').textContent = '';
+    $('sline').textContent = 'Stitching pages together...';
+    await new Promise(r => setTimeout(r, 50));
+
+    try {
+      if (!jsPDF) {
+        if (!window.jspdf) { fail('jsPDF library failed to load'); return; }
+        jsPDF = window.jspdf.jsPDF;
+      }
+
+      // Detect dimensions from first image
+      const firstImg = await loadImage(images[0]);
+      const pw = firstImg.naturalWidth * 0.264583;
+      const ph = firstImg.naturalHeight * 0.264583;
+
+      const doc = new jsPDF({ orientation: pw > ph ? 'l' : 'p', unit: 'mm', format: [pw, ph] });
+      let first = true;
+
+      for (let i = 0; i < images.length; i++) {
+        if (!first) doc.addPage([pw, ph]);
+        first = false;
+        doc.addImage(images[i], 'JPEG', 0, 0, pw, ph);
+        images[i] = null;
+        if (i % 5 === 0) {
+          $('sline').textContent = `Stitching page ${i + 1} / ${images.length}...`;
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+
+      pdfBlob = doc.output('blob');
+      showDone(images.length + failed.length - failed.length, failed);
+    } catch (e) {
+      fail('PDF assembly failed: ' + e.message);
+    }
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+  }
+}
+
 async function runLocal(url) {
   try {
     const res = await fetch('/api/convert', {
@@ -508,6 +643,8 @@ async function run() {
 
   if (IS_VERCEL && activeTab === 'anyflip') {
     await runAnyflipVercel(url);
+  } else if (IS_VERCEL && activeTab === 'scribd') {
+    await runScribdVercel(url);
   } else {
     await runLocal(url);
   }
