@@ -85,21 +85,23 @@ module.exports = async (req, res) => {
       await page.waitForNetworkIdle({ timeout: 15000 });
     } catch {}
 
-    // Check for Cloudflare challenge
+    // Check for Cloudflare / Scribd bot protection
     const isBlocked = await page.evaluate(() => {
       const title = document.title.toLowerCase();
       const body = document.body?.innerText?.toLowerCase() || "";
       return (
         title.includes("just a moment") ||
         title.includes("attention required") ||
+        title.includes("client challenge") ||
         body.includes("checking your browser") ||
-        body.includes("cloudflare")
+        body.includes("cloudflare") ||
+        body.includes("client challenge")
       );
     });
 
     if (isBlocked) {
       send("error", {
-        error: "Scribd's Cloudflare protection blocked this request. Try running locally.",
+        error: "Scribd's bot protection blocked this request from the cloud. Scribd only works locally — run python3 extractor_server.py on your machine.",
       });
       res.end();
       return;

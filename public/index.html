@@ -264,7 +264,7 @@ function switchTab(tab) {
   $('inp').placeholder = PLACEHOLDERS[tab];
   $('go').className = 'btn btn-go' + (tab === 'scribd' ? ' scribd' : '');
 
-  $('scribd-disabled').hidden = true;
+  $('scribd-disabled').hidden = !(tab === 'scribd' && IS_VERCEL);
   $('go').disabled = false;
 
   reset();
