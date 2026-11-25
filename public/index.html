@@ -230,9 +230,9 @@ body { font-family: var(--font); background: var(--bg); color: var(--fg); min-he
   </div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.2/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.2/jspdf.umd.min.js" crossorigin="anonymous"></script>
 <script>
-const { jsPDF } = window.jspdf;
+let jsPDF;
 const IS_VERCEL = !location.hostname.match(/^(localhost|127\.0\.0\.1)$/);
 
 let activeTab = 'anyflip';
@@ -342,6 +342,10 @@ async function runAnyflipVercel(url) {
   await new Promise(r => requestAnimationFrame(() => setTimeout(r, 50)));
 
   try {
+    if (!jsPDF) {
+      if (!window.jspdf) { fail('jsPDF library failed to load'); return; }
+      jsPDF = window.jspdf.jsPDF;
+    }
     const pw = (cfg.pageWidth || 595) * 0.3528;
     const ph = (cfg.pageHeight || 842) * 0.3528;
     const doc = new jsPDF({ orientation: pw > ph ? 'l' : 'p', unit: 'mm', format: [pw, ph] });
