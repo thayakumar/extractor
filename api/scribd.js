@@ -126,24 +126,74 @@ module.exports = async (req, res) => {
       } catch {}
     }
 
+    // Wait for Scribd to render content
+    send("status", { status: "waiting", message: "Waiting for document to render..." });
+
+    // Wait for .outer_page or .page_container elements to appear
+    try {
+      await page.waitForSelector(".outer_page, .page_container, .text_layer", {
+        timeout: 30000,
+      });
+    } catch {
+      // If no pages appear, try waiting more and scrolling
+      send("status", { status: "waiting", message: "Triggering page load..." });
+      await page.evaluate(() => {
+        const scroller =
+          document.querySelector(".document_scroller") ||
+          document.scrollingElement ||
+          document.documentElement;
+        if (scroller) scroller.scrollTop = 100;
+      });
+      await page.waitForTimeout(5000);
+    }
+
     // Try docManager approach first (themrsami method)
     send("status", { status: "loading_pages", message: "Loading pages..." });
 
-    const pageInfo = await page.evaluate(() => {
-      const dm =
-        window.docManager ||
-        (window.Scribd && window.Scribd.Document && window.Scribd.Document.docManager);
-      if (dm && dm.pages) {
-        return { count: dm.pages.length, hasDocManager: true };
-      }
-      // Fallback: count .outer_page elements
-      const pages = document.querySelectorAll(".outer_page");
-      return { count: pages.length, hasDocManager: false };
-    });
+    // Poll for pages to appear (Scribd loads them progressively)
+    let pageInfo = { count: 0, hasDocManager: false };
+    for (let attempt = 0; attempt < 10; attempt++) {
+      pageInfo = await page.evaluate(() => {
+        const dm =
+          window.docManager ||
+          (window.Scribd &&
+            window.Scribd.Document &&
+            window.Scribd.Document.docManager);
+        if (dm && dm.pages && dm.pages.length > 0) {
+          return { count: dm.pages.length, hasDocManager: true };
+        }
+        const pages = document.querySelectorAll(".outer_page");
+        if (pages.length > 0) {
+          return { count: pages.length, hasDocManager: false };
+        }
+        // Also check for page_container divs
+        const containers = document.querySelectorAll('[class*="page_container"], [class*="PageContainer"]');
+        if (containers.length > 0) {
+          return { count: containers.length, hasDocManager: false };
+        }
+        return { count: 0, hasDocManager: false };
+      });
+
+      if (pageInfo.count > 0) break;
+      send("status", {
+        status: "waiting",
+        message: `Waiting for pages to load (attempt ${attempt + 1}/10)...`,
+      });
+      await page.waitForTimeout(3000);
+    }
 
     if (pageInfo.count === 0) {
+      // Last resort: take a debug screenshot of what we see
+      const debugHtml = await page.evaluate(() => {
+        return {
+          title: document.title,
+          bodyClasses: document.body?.className || "",
+          childCount: document.body?.children?.length || 0,
+          text: (document.body?.innerText || "").substring(0, 500),
+        };
+      });
       send("error", {
-        error: "No pages found. The document may be restricted or require login.",
+        error: `No pages found. Page title: "${debugHtml.title}". The document may be restricted, require login, or the embed format has changed.`,
       });
       res.end();
       return;
@@ -256,8 +306,20 @@ module.exports = async (req, res) => {
       total: pageInfo.count,
     });
 
-    const pageElements = await page.$$(".outer_page");
+    let pageElements = await page.$$(".outer_page");
+    if (pageElements.length === 0) {
+      pageElements = await page.$$('[class*="page_container"], [class*="PageContainer"]');
+    }
+    if (pageElements.length === 0) {
+      pageElements = await page.$$(".page");
+    }
     const actualCount = pageElements.length;
+
+    if (actualCount === 0) {
+      send("error", { error: "Pages loaded but could not find page elements for capture." });
+      res.end();
+      return;
+    }
 
     for (let i = 0; i < actualCount; i++) {
       try {
