@@ -276,8 +276,9 @@ def scribd_convert(job_id, url):
             pdf_name = f"{safe_title}.pdf"
             pdf_path = OUTPUT_DIR / pdf_name
 
+            raw_pdf_path = OUTPUT_DIR / f"_raw_{pdf_name}"
             page.pdf(
-                path=str(pdf_path),
+                path=str(raw_pdf_path),
                 print_background=True,
                 width=f"{dims['w']}px",
                 height=f"{dims['h']}px",
@@ -286,7 +287,33 @@ def scribd_convert(job_id, url):
 
             browser.close()
 
-        _finish_job(job, pdf_path, pdf_name, dims["count"])
+        # Strip blank pages from the PDF
+        try:
+            from pypdf import PdfReader, PdfWriter
+            reader = PdfReader(str(raw_pdf_path))
+            writer = PdfWriter()
+            for pg in reader.pages:
+                text = (pg.extract_text() or "").strip()
+                has_images = len(pg.images) > 0 if hasattr(pg, "images") else False
+                if text or has_images:
+                    writer.add_page(pg)
+            if len(writer.pages) > 0:
+                writer.write(str(pdf_path))
+            else:
+                # Fallback: keep all pages if detection stripped everything
+                import shutil
+                shutil.copy2(str(raw_pdf_path), str(pdf_path))
+            raw_pdf_path.unlink(missing_ok=True)
+        except ImportError:
+            # pypdf not installed — use raw PDF as-is
+            raw_pdf_path.rename(pdf_path)
+
+        try:
+            from pypdf import PdfReader as _PR
+            actual_pages = len(_PR(str(pdf_path)).pages)
+        except Exception:
+            actual_pages = dims["count"]
+        _finish_job(job, pdf_path, pdf_name, actual_pages)
 
     except Exception as e:
         job["status"] = "error"
