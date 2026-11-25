@@ -121,101 +121,172 @@ def anyflip_convert(job_id, url):
 
 # ── Scribd ─────────────────────────────────────────────────────
 
+SCRIBD_EMBED = "https://www.scribd.com/embeds/{doc_id}/content?view_mode=scroll"
+
+CONSENT_SELECTORS = [
+    ".osano-cm-accept-all",
+    ".osano-cm-accept",
+    'button:has-text("Accept All")',
+]
+
+SCROLL_JS = r"""
+async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const scroller =
+        document.querySelector('.document_scroller') ||
+        document.scrollingElement ||
+        document.documentElement;
+    const step = Math.max(400, Math.floor(scroller.clientHeight * 0.9));
+    let pos = 0;
+    while (pos < scroller.scrollHeight) {
+        scroller.scrollTop = pos;
+        await sleep(250);
+        pos += step;
+    }
+    scroller.scrollTop = scroller.scrollHeight;
+    await sleep(600);
+    scroller.scrollTop = 0;
+    await sleep(400);
+}
+"""
+
+FLATTEN_CSS = r"""
+html, body {
+    height: auto !important; max-height: none !important;
+    overflow: visible !important; margin: 0 !important;
+    padding: 0 !important; background: white !important;
+}
+.document_scroller, [class*="document_scroller"], [class*="doc_container"] {
+    height: auto !important; max-height: none !important;
+    min-height: 0 !important; overflow: visible !important;
+    position: static !important;
+}
+.osano-cm-window, .osano-cm-dialog, [class*="osano-cm"],
+.global_header, .embed_header, .embed_footer,
+[class*="toolbar"], [class*="banner"],
+[id*="download"], [class*="download_button"],
+a[href*="download"], button[class*="download" i] {
+    display: none !important;
+}
+.outer_page {
+    page-break-after: always !important;
+    break-after: page !important;
+    margin: 0 auto !important;
+    box-shadow: none !important;
+}
+.outer_page:last-child {
+    page-break-after: auto !important;
+    break-after: auto !important;
+}
+"""
+
+
+def _extract_scribd_id(url):
+    m = re.search(r"scribd\.com/(?:document|doc|presentation)/(\d+)", url)
+    return m.group(1) if m else None
+
+
 def scribd_convert(job_id, url):
     job = jobs[job_id]
     if not HAS_PLAYWRIGHT:
         job["status"] = "error"
-        job["error"] = "Scribd requires Playwright (local only). Install: pip3 install playwright && playwright install chromium"
+        job["error"] = "Scribd requires Playwright. Install: pip3 install playwright && playwright install chromium"
         return
 
     try:
+        doc_id = _extract_scribd_id(url)
+        if not doc_id:
+            raise ValueError("Could not extract Scribd document ID from URL")
+
+        embed_url = SCRIBD_EMBED.format(doc_id=doc_id)
         job["status"] = "launching"
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                viewport={"width": 1200, "height": 1600},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
                            "Chrome/131.0.0.0 Safari/537.36",
             )
             page = context.new_page()
 
-            saved = {}
-
-            def on_response(resp):
-                u = resp.url
-                if "html.scribdassets.com" not in u or "/images/" not in u:
-                    return
-                m = re.search(r"/images/(\d+)-", u)
-                if not m:
-                    return
-                pn = int(m.group(1))
-                if pn in saved:
-                    return
-                try:
-                    saved[pn] = resp.body()
-                    job["done"] = len(saved)
-                except Exception:
-                    pass
-
-            page.on("response", on_response)
-
             job["status"] = "loading"
-            page.goto(url, wait_until="networkidle", timeout=45000)
-            page.wait_for_timeout(2000)
+            page.goto(embed_url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
 
+            # Dismiss cookie consent
+            for sel in CONSENT_SELECTORS:
+                try:
+                    btn = page.locator(sel).first
+                    if btn.count() and btn.is_visible():
+                        btn.click(timeout=2000)
+                        page.wait_for_timeout(400)
+                        break
+                except Exception:
+                    continue
+
+            # Get title
             info = page.evaluate(r"""() => {
-                const t = document.title || '';
-                const m = document.body.innerText.match(/(\d+)\s+pages?/i);
-                return { title: t.replace(/ \| PDF$/i, '').trim(), totalPages: m ? parseInt(m[1]) : 0 };
+                const og = document.querySelector('meta[property="og:title"]');
+                const t = og ? og.content : document.title || '';
+                return { title: t.replace(/ \| PDF$/i, '').trim() };
+            }""")
+            job["title"] = info["title"] or "scribd_document"
+
+            # Scroll to lazy-load all pages
+            job["status"] = "scrolling"
+            page.evaluate(SCROLL_JS)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+
+            # Get page count and dimensions
+            dims = page.evaluate(r"""() => {
+                const ps = document.querySelectorAll('.outer_page');
+                if (!ps.length) return null;
+                let maxW = 0, maxH = 0;
+                ps.forEach((p) => {
+                    const r = p.getBoundingClientRect();
+                    if (r.width  > maxW) maxW = r.width;
+                    if (r.height > maxH) maxH = r.height;
+                });
+                return { w: Math.ceil(maxW), h: Math.ceil(maxH) + 4, count: ps.length };
             }""")
 
-            job["title"] = info["title"] or "scribd_document"
-            job["total"] = info["totalPages"]
-            job["status"] = "scrolling"
+            if not dims:
+                raise ValueError("No pages found — the document may require login or is restricted.")
 
-            last_count = 0
-            stale_rounds = 0
-            while True:
-                page.evaluate("window.scrollBy(0, 600)")
-                page.wait_for_timeout(500)
-                total = job["total"]
-                if total > 0 and len(saved) >= total:
-                    break
-                if len(saved) == last_count:
-                    stale_rounds += 1
-                    if stale_rounds > 50:
-                        break
-                else:
-                    stale_rounds = 0
-                    last_count = len(saved)
+            job["total"] = dims["count"]
+            job["done"] = dims["count"]
+
+            # Flatten layout and hide chrome
+            page.add_style_tag(content=FLATTEN_CSS)
+            page.wait_for_timeout(600)
+
+            # Use Chromium's native PDF export (same as scribdefiler)
+            job["status"] = "assembling"
+            page.emulate_media(media="screen")
+
+            safe_title = re.sub(r'[^\w\s-]', '', job["title"]).strip()[:60] or "scribd_document"
+            pdf_name = f"{safe_title}.pdf"
+            pdf_path = OUTPUT_DIR / pdf_name
+
+            page.pdf(
+                path=str(pdf_path),
+                print_background=True,
+                width=f"{dims['w']}px",
+                height=f"{dims['h']}px",
+                margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
+            )
 
             browser.close()
 
-        if not saved:
-            raise ValueError("No pages captured — the document may require a subscription.")
-
-        job["status"] = "assembling"
-        job["done"] = len(saved)
-        ordered = sorted(saved.keys())
-
-        safe_title = re.sub(r'[^\w\s-]', '', job["title"]).strip()[:60] or "scribd_document"
-        pdf_name = f"{safe_title}.pdf"
-        pdf_path = OUTPUT_DIR / pdf_name
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            images = []
-            for pn in ordered:
-                img_path = os.path.join(tmpdir, f"{pn:04d}.jpg")
-                with open(img_path, "wb") as f:
-                    f.write(saved[pn])
-                images.append(Image.open(img_path).convert("RGB"))
-            images[0].save(str(pdf_path), "PDF", save_all=True, append_images=images[1:])
-            for img in images:
-                img.close()
-
-        _finish_job(job, pdf_path, pdf_name, len(ordered))
+        _finish_job(job, pdf_path, pdf_name, dims["count"])
 
     except Exception as e:
         job["status"] = "error"

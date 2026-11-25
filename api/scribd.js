@@ -2,6 +2,7 @@ const chromium = require("@sparticuz/chromium");
 const puppeteer = require("puppeteer-core");
 
 const EMBED_URL = "https://www.scribd.com/embeds/{id}/content?view_mode=scroll";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function extractDocId(url) {
   const m = url.match(/scribd\.com\/(?:document|doc|presentation)\/(\d+)/);
@@ -30,7 +31,6 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // SSE setup
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -62,7 +62,6 @@ module.exports = async (req, res) => {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     );
 
-    // Hide automation signals
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
       delete navigator.__proto__.webdriver;
@@ -77,9 +76,7 @@ module.exports = async (req, res) => {
     });
 
     if (!response || response.status() === 403) {
-      send("error", {
-        error: "Scribd blocked access (Cloudflare). Try running locally.",
-      });
+      send("error", { error: "Scribd blocked access (403). Try running locally." });
       res.end();
       return;
     }
@@ -102,40 +99,32 @@ module.exports = async (req, res) => {
 
     if (isBlocked) {
       send("error", {
-        error:
-          "Scribd's Cloudflare protection blocked this request. Scribd extraction only works locally for now.",
+        error: "Scribd's Cloudflare protection blocked this request. Try running locally.",
       });
       res.end();
       return;
     }
 
     // Dismiss cookie consent
-    const consentSelectors = [
-      ".osano-cm-accept-all",
-      ".osano-cm-accept",
-      'button:has-text("Accept All")',
-    ];
-    for (const sel of consentSelectors) {
+    for (const sel of [".osano-cm-accept-all", ".osano-cm-accept"]) {
       try {
         const btn = await page.$(sel);
         if (btn) {
           await btn.click();
-          await page.waitForTimeout(400);
+          await sleep(400);
           break;
         }
       } catch {}
     }
 
-    // Wait for Scribd to render content
+    // Wait for page elements to appear
     send("status", { status: "waiting", message: "Waiting for document to render..." });
 
-    // Wait for .outer_page or .page_container elements to appear
     try {
       await page.waitForSelector(".outer_page, .page_container, .text_layer", {
         timeout: 30000,
       });
     } catch {
-      // If no pages appear, try waiting more and scrolling
       send("status", { status: "waiting", message: "Triggering page load..." });
       await page.evaluate(() => {
         const scroller =
@@ -144,56 +133,43 @@ module.exports = async (req, res) => {
           document.documentElement;
         if (scroller) scroller.scrollTop = 100;
       });
-      await page.waitForTimeout(5000);
+      await sleep(5000);
     }
 
-    // Try docManager approach first (themrsami method)
     send("status", { status: "loading_pages", message: "Loading pages..." });
 
-    // Poll for pages to appear (Scribd loads them progressively)
+    // Poll for pages (Scribd renders asynchronously)
     let pageInfo = { count: 0, hasDocManager: false };
     for (let attempt = 0; attempt < 10; attempt++) {
       pageInfo = await page.evaluate(() => {
         const dm =
           window.docManager ||
-          (window.Scribd &&
-            window.Scribd.Document &&
-            window.Scribd.Document.docManager);
+          (window.Scribd && window.Scribd.Document && window.Scribd.Document.docManager);
         if (dm && dm.pages && dm.pages.length > 0) {
           return { count: dm.pages.length, hasDocManager: true };
         }
         const pages = document.querySelectorAll(".outer_page");
-        if (pages.length > 0) {
-          return { count: pages.length, hasDocManager: false };
-        }
-        // Also check for page_container divs
+        if (pages.length > 0) return { count: pages.length, hasDocManager: false };
         const containers = document.querySelectorAll('[class*="page_container"], [class*="PageContainer"]');
-        if (containers.length > 0) {
-          return { count: containers.length, hasDocManager: false };
-        }
+        if (containers.length > 0) return { count: containers.length, hasDocManager: false };
         return { count: 0, hasDocManager: false };
       });
 
       if (pageInfo.count > 0) break;
       send("status", {
         status: "waiting",
-        message: `Waiting for pages to load (attempt ${attempt + 1}/10)...`,
+        message: `Waiting for pages (${attempt + 1}/10)...`,
       });
-      await page.waitForTimeout(3000);
+      await sleep(3000);
     }
 
     if (pageInfo.count === 0) {
-      // Last resort: take a debug screenshot of what we see
-      const debugHtml = await page.evaluate(() => {
-        return {
-          title: document.title,
-          bodyClasses: document.body?.className || "",
-          childCount: document.body?.children?.length || 0,
-          text: (document.body?.innerText || "").substring(0, 500),
-        };
-      });
+      const debug = await page.evaluate(() => ({
+        title: document.title,
+        text: (document.body?.innerText || "").substring(0, 300),
+      }));
       send("error", {
-        error: `No pages found. Page title: "${debugHtml.title}". The document may be restricted, require login, or the embed format has changed.`,
+        error: `No pages found. Page title: "${debug.title}". Document may be restricted or require login.`,
       });
       res.end();
       return;
@@ -214,23 +190,17 @@ module.exports = async (req, res) => {
       const BATCH = 8;
       for (let start = 0; start < pageInfo.count; start += BATCH) {
         const end = Math.min(start + BATCH, pageInfo.count);
-        await page.evaluate(
-          async (s, e) => {
-            const dm =
-              window.docManager ||
-              window.Scribd.Document.docManager;
-            const promises = [];
-            for (let i = s; i < e; i++) {
-              const p = dm.pages[i];
-              if (p && p.load) promises.push(p.load());
-              if (p && p.display) promises.push(p.display());
-              if (p && p.turnOnImages) promises.push(p.turnOnImages());
-            }
-            await Promise.allSettled(promises);
-          },
-          start,
-          end
-        );
+        await page.evaluate(async (s, e) => {
+          const dm = window.docManager || window.Scribd.Document.docManager;
+          const promises = [];
+          for (let i = s; i < e; i++) {
+            const p = dm.pages[i];
+            if (p && p.load) promises.push(p.load());
+            if (p && p.display) promises.push(p.display());
+            if (p && p.turnOnImages) promises.push(p.turnOnImages());
+          }
+          await Promise.allSettled(promises);
+        }, start, end);
         send("status", {
           status: "loading_pages",
           message: `Loading pages ${end}/${pageInfo.count}...`,
@@ -239,25 +209,25 @@ module.exports = async (req, res) => {
         });
       }
     } else {
-      // Fallback: scroll to lazy-load
+      // Fallback: scroll to lazy-load all content
+      send("status", { status: "scrolling", message: "Scrolling to load all pages..." });
       await page.evaluate(async () => {
-        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const s = (ms) => new Promise((r) => setTimeout(r, ms));
         const scroller =
           document.querySelector(".document_scroller") ||
           document.scrollingElement ||
           document.documentElement;
         const step = Math.max(400, Math.floor(scroller.clientHeight * 0.9));
         let pos = 0;
-        const total = scroller.scrollHeight;
-        while (pos < total) {
+        while (pos < scroller.scrollHeight) {
           scroller.scrollTop = pos;
-          await sleep(300);
+          await s(300);
           pos += step;
         }
         scroller.scrollTop = scroller.scrollHeight;
-        await sleep(600);
+        await s(600);
         scroller.scrollTop = 0;
-        await sleep(400);
+        await s(400);
       });
     }
 
@@ -265,7 +235,7 @@ module.exports = async (req, res) => {
       await page.waitForNetworkIdle({ timeout: 10000 });
     } catch {}
 
-    // Inject CSS to flatten layout and hide chrome
+    // Inject CSS to flatten layout and hide Scribd chrome
     await page.addStyleTag({
       content: `
         html, body {
@@ -296,36 +266,24 @@ module.exports = async (req, res) => {
         }
       `,
     });
-    await page.waitForTimeout(500);
+    await sleep(500);
 
-    // Screenshot each page individually (avoids blank page issue)
-    send("status", {
-      status: "capturing",
-      message: "Capturing pages...",
-      done: 0,
-      total: pageInfo.count,
-    });
+    // Screenshot each page individually
+    send("status", { status: "capturing", message: "Capturing pages...", done: 0, total: pageInfo.count });
 
     let pageElements = await page.$$(".outer_page");
-    if (pageElements.length === 0) {
-      pageElements = await page.$$('[class*="page_container"], [class*="PageContainer"]');
-    }
-    if (pageElements.length === 0) {
-      pageElements = await page.$$(".page");
-    }
-    const actualCount = pageElements.length;
+    if (!pageElements.length) pageElements = await page.$$('[class*="page_container"], [class*="PageContainer"]');
+    if (!pageElements.length) pageElements = await page.$$(".page");
 
-    if (actualCount === 0) {
+    if (!pageElements.length) {
       send("error", { error: "Pages loaded but could not find page elements for capture." });
       res.end();
       return;
     }
 
-    for (let i = 0; i < actualCount; i++) {
+    for (let i = 0; i < pageElements.length; i++) {
       try {
         const el = pageElements[i];
-
-        // Check if page has real content (skip blank pages)
         const hasContent = await el.evaluate((node) => {
           const rect = node.getBoundingClientRect();
           if (rect.width < 10 || rect.height < 10) return false;
@@ -333,26 +291,15 @@ module.exports = async (req, res) => {
           const text = node.innerText?.trim() || "";
           return imgs.length > 0 || text.length > 10;
         });
-
         if (!hasContent) continue;
 
-        const screenshot = await el.screenshot({
-          type: "jpeg",
-          quality: 90,
-        });
-
-        const base64 = screenshot.toString("base64");
-        send("page", {
-          index: i,
-          total: actualCount,
-          data: base64,
-        });
-
+        const screenshot = await el.screenshot({ type: "jpeg", quality: 90 });
+        send("page", { index: i, total: pageElements.length, data: screenshot.toString("base64") });
         send("status", {
           status: "capturing",
-          message: `Captured page ${i + 1}/${actualCount}`,
+          message: `Captured page ${i + 1}/${pageElements.length}`,
           done: i + 1,
-          total: actualCount,
+          total: pageElements.length,
         });
       } catch {
         send("page_error", { index: i, message: `Failed to capture page ${i + 1}` });
@@ -364,9 +311,7 @@ module.exports = async (req, res) => {
     send("error", { error: err.message || "Unknown error" });
   } finally {
     if (browser) {
-      try {
-        await browser.close();
-      } catch {}
+      try { await browser.close(); } catch {}
     }
     res.end();
   }
